@@ -1,15 +1,6 @@
 {
-  "name": "fast-web-proxy",
-  "version": "4.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.21.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "name": "fast-proxy",
+  "version": "9.0.0",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "cors": "^2.8.5", "express": "^4.21.0" }
 }

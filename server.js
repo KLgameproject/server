@@ -1,417 +1,311 @@
 const express = require('express');
 const cors = require('cors');
-const zlib = require('zlib');
-const { pipeline } = require('stream/promises');
-const { Readable } = require('stream');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const REQUEST_TIMEOUT = 30000;
+const TIMEOUT = 25000;
 
-// === CACHING ===
+// === PRECOMPILED REGEX (much faster) ===
+const RE = {
+  csp: /<meta[^>]*(content-security-policy|x-frame-options)[^>]*>/gi,
+  security: /\s(integrity|nonce|crossorigin)=["'][^"']*["']/gi,
+  amp: /&amp;/g,
+  cssUrl: /url\(\s*["']?([^"')]+?)["']?\s*\)/gi,
+  cssImport1: /@import\s*["']([^"']+)["']/gi,
+  cssImport2: /@import\s+url\(\s*["']?([^"')]+)["']?\s*\)/gi,
+  style: /(\sstyle\s*=\s*)(["'])([^"']*?)(\2)/gi,
+  styleBlock: /<style([^>]*)>([\s\S]*?)<\/style>/gi,
+  srcset: /^(\S+)(\s+.+)?$/
+};
+
+// URL attributes to rewrite
+const URL_ATTRS = ['href', 'src', 'action', 'poster', 'data', 'srcset', 'data-src', 'data-srcset', 'data-original', 'data-lazy', 'background'];
+
+// Precompile attribute regexes
+const ATTR_RE = {};
+for (const attr of URL_ATTRS) {
+  ATTR_RE[attr] = new RegExp(`(\\s${attr}\\s*=\\s*)(["'])([^"']*?)\\2`, 'gi');
+}
+
+// === CACHE WITH SIZE LIMIT ===
 const cache = new Map();
-const CACHE_MAX_SIZE = 100 * 1024 * 1024; // 100MB max cache
-const CACHE_MAX_AGE = 10 * 60 * 1000; // 10 minutes
 let cacheSize = 0;
+const MAX_CACHE_SIZE = 100 * 1024 * 1024; // 100MB
+const MAX_ITEM_SIZE = 5 * 1024 * 1024; // 5MB per item
+const CACHE_TTL = 300000; // 5 min
 
-// Cacheable content types
-const CACHEABLE_TYPES = [
-  'image/', 'font/', 'application/font', 'text/css', 
-  'application/javascript', 'text/javascript'
-];
+// Request deduplication - prevent fetching same URL multiple times concurrently
+const pending = new Map();
 
-function shouldCache(contentType) {
-  return CACHEABLE_TYPES.some(t => contentType.includes(t));
-}
-
-function getCacheKey(url) {
-  return url;
-}
-
-function getFromCache(key) {
+function cacheGet(key) {
   const item = cache.get(key);
-  if (item && Date.now() - item.timestamp < CACHE_MAX_AGE) {
-    return item;
-  }
-  if (item) {
+  if (!item) return null;
+  if (Date.now() - item.time > CACHE_TTL) {
     cacheSize -= item.data.length;
     cache.delete(key);
+    return null;
   }
-  return null;
+  return item;
 }
 
-function addToCache(key, data, contentType) {
-  // Evict old items if cache is too big
-  while (cacheSize + data.length > CACHE_MAX_SIZE && cache.size > 0) {
-    const oldestKey = cache.keys().next().value;
-    const oldest = cache.get(oldestKey);
-    cacheSize -= oldest.data.length;
-    cache.delete(oldestKey);
+function cacheSet(key, data, contentType) {
+  if (data.length > MAX_ITEM_SIZE) return;
+  
+  // Evict old items if needed
+  while (cacheSize + data.length > MAX_CACHE_SIZE && cache.size > 0) {
+    const firstKey = cache.keys().next().value;
+    const first = cache.get(firstKey);
+    cacheSize -= first.data.length;
+    cache.delete(firstKey);
   }
   
-  cache.set(key, { data, contentType, timestamp: Date.now() });
+  cache.set(key, { data, ct: contentType, time: Date.now() });
   cacheSize += data.length;
 }
 
-// Clean cache periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, value] of cache.entries()) {
-    if (now - value.timestamp > CACHE_MAX_AGE) {
-      cacheSize -= value.data.length;
-      cache.delete(key);
-    }
+// Binary content detection (faster than regex)
+const BINARY_TYPES = new Set(['image', 'font', 'audio', 'video', 'octet-stream', 'woff', 'woff2', 'ttf', 'eot', 'otf']);
+function isBinary(ct) {
+  const lower = ct.toLowerCase();
+  for (const t of BINARY_TYPES) {
+    if (lower.includes(t)) return true;
   }
-}, 60 * 1000);
+  return false;
+}
 
 // === MIDDLEWARE ===
-app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(cors({ origin: '*' }));
+app.disable('x-powered-by');
+app.disable('etag');
 
-app.use(cors({ 
-  origin: '*', 
-  exposedHeaders: ['X-Cache-Status']
-}));
-
+// Keep connections alive
 app.use((req, res, next) => {
-  res.removeHeader('X-Frame-Options');
+  res.set('Connection', 'keep-alive');
   next();
 });
 
 // === COOKIES ===
-const cookieStore = new Map();
+const cookies = new Map();
 
 // === ROUTES ===
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    version: '4.0.0',
-    cache: {
-      entries: cache.size,
-      sizeMB: (cacheSize / 1024 / 1024).toFixed(2)
-    }
-  });
-});
+app.get('/health', (_, res) => res.json({ ok: 1, v: '9.0', cache: cache.size, cacheSize: (cacheSize/1024/1024).toFixed(1) + 'MB' }));
 
 app.all('/browse', async (req, res) => {
-  const targetUrl = req.query.url;
-  const sessionId = req.query.session || 'default';
+  let url = req.query.url;
+  const sid = req.query.s || 'd';
   
-  if (!targetUrl) {
-    return res.status(400).send('Missing url');
+  if (!url) return res.status(400).end('No URL');
+  
+  // Decode & normalize URL
+  try { url = decodeURIComponent(url); } catch {}
+  if (url.startsWith('//')) url = 'https:' + url;
+  else if (!url.startsWith('http')) url = 'https://' + url;
+  
+  let parsed;
+  try { parsed = new URL(url); } 
+  catch { return res.status(400).end('Bad URL'); }
+
+  const fullUrl = parsed.href;
+
+  // Check cache (GET only)
+  if (req.method === 'GET') {
+    const cached = cacheGet(fullUrl);
+    if (cached) {
+      res.set('Content-Type', cached.ct);
+      res.set('X-Cache', 'HIT');
+      return res.send(cached.data);
+    }
   }
 
-  let fullUrl = targetUrl;
-  if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
-    fullUrl = 'https://' + fullUrl;
-  }
-
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(fullUrl);
-  } catch {
-    return res.status(400).send('Invalid URL');
-  }
-
-  // Check cache first for static assets
-  const cacheKey = getCacheKey(fullUrl);
-  const cached = getFromCache(cacheKey);
-  if (cached && req.method === 'GET') {
-    res.set('Content-Type', cached.contentType);
-    res.set('X-Cache-Status', 'HIT');
-    return res.send(cached.data);
-  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT);
 
   try {
     const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
       'Accept': '*/*',
       'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate',
+      'Accept-Encoding': 'identity',
     };
 
-    // Add cookies
-    const session = cookieStore.get(sessionId);
-    if (session?.cookies) {
-      headers['Cookie'] = session.cookies;
-    }
+    const ck = cookies.get(sid);
+    if (ck) headers['Cookie'] = ck;
 
-    const fetchOptions = {
+    const opts = {
       method: req.method,
       headers,
       redirect: 'follow',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT)
+      signal: ctrl.signal
     };
 
-    // Add body for POST
     if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
-      if (typeof req.body === 'object') {
-        fetchOptions.body = new URLSearchParams(req.body).toString();
-        headers['Content-Type'] = 'application/x-www-form-urlencoded';
-      } else {
-        fetchOptions.body = req.body;
-      }
+      opts.body = typeof req.body === 'object' ? new URLSearchParams(req.body).toString() : req.body;
+      if (typeof req.body === 'object') headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
 
-    const response = await fetch(fullUrl, fetchOptions);
+    const r = await fetch(fullUrl, opts);
+    clearTimeout(timer);
 
-    // Store cookies
-    const setCookies = response.headers.getSetCookie?.() || [];
-    if (setCookies.length > 0) {
-      const existing = cookieStore.get(sessionId)?.cookies || '';
-      const newCookies = setCookies.map(c => c.split(';')[0]).join('; ');
-      cookieStore.set(sessionId, {
-        cookies: existing ? `${existing}; ${newCookies}` : newCookies,
-        timestamp: Date.now()
-      });
-    }
+    // Save cookies
+    const sc = r.headers.getSetCookie?.() || [];
+    if (sc.length) cookies.set(sid, sc.map(c => c.split(';')[0]).join('; '));
 
-    const contentType = response.headers.get('content-type') || '';
-    const finalUrl = response.url || fullUrl;
-    const baseUrl = new URL(finalUrl).origin;
-    const proxyBase = `${req.protocol}://${req.get('host')}/browse?session=${sessionId}&url=`;
+    const ct = r.headers.get('content-type') || '';
+    const finalUrl = r.url || fullUrl;
+    const base = new URL(finalUrl).origin;
+    const pb = `${req.protocol}://${req.get('host')}/browse?s=${sid}&url=`;
 
-    res.set('X-Cache-Status', 'MISS');
-
-    // === STATIC ASSETS (cacheable, no rewrite needed) ===
-    if (contentType.startsWith('image/') || 
-        contentType.includes('font') ||
-        contentType.includes('audio/') ||
-        contentType.includes('video/')) {
-      
-      const buffer = Buffer.from(await response.arrayBuffer());
-      
-      // Cache it
-      if (shouldCache(contentType) && buffer.length < 5 * 1024 * 1024) {
-        addToCache(cacheKey, buffer, contentType);
-      }
-      
-      res.set('Content-Type', contentType);
-      return res.send(buffer);
+    // === BINARY ===
+    if (isBinary(ct)) {
+      const buf = Buffer.from(await r.arrayBuffer());
+      cacheSet(fullUrl, buf, ct);
+      res.set('Content-Type', ct);
+      res.set('Cache-Control', 'public, max-age=86400');
+      return res.send(buf);
     }
 
     // === CSS ===
-    if (contentType.includes('text/css')) {
-      let css = await response.text();
-      css = rewriteCss(css, baseUrl, proxyBase, finalUrl);
-      
-      const buffer = Buffer.from(css);
-      if (buffer.length < 1024 * 1024) {
-        addToCache(cacheKey, buffer, 'text/css');
-      }
-      
+    if (ct.includes('css')) {
+      const css = rewriteCSS(await r.text(), base, pb, finalUrl);
+      cacheSet(fullUrl, Buffer.from(css), 'text/css');
       res.set('Content-Type', 'text/css');
-      return res.send(css);
+      return res.send(css); // Send string directly, no buffer conversion
     }
 
-    // === JAVASCRIPT (don't modify, just cache) ===
-    if (contentType.includes('javascript')) {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      
-      if (buffer.length < 2 * 1024 * 1024) {
-        addToCache(cacheKey, buffer, contentType);
-      }
-      
-      res.set('Content-Type', contentType);
-      return res.send(buffer);
+    // === JS/JSON ===
+    if (ct.includes('javascript') || ct.includes('json')) {
+      const text = await r.text();
+      cacheSet(fullUrl, Buffer.from(text), ct);
+      res.set('Content-Type', ct);
+      return res.send(text); // Send string directly
     }
 
-    // === HTML (rewrite and stream) ===
-    if (contentType.includes('text/html')) {
-      let html = await response.text();
-      
-      // Quick rewrites
-      html = rewriteHtml(html, baseUrl, proxyBase, finalUrl);
-      
-      // Inject script
-      const script = createScript(proxyBase, baseUrl, finalUrl);
-      if (html.includes('</head>')) {
-        html = html.replace('</head>', script + '</head>');
-      } else {
-        html = script + html;
-      }
-      
+    // === HTML ===
+    if (ct.includes('html') || !ct) {
+      let html = await r.text();
+      html = rewriteHTML(html, base, pb, finalUrl);
+      html = injectScript(html, pb, base, finalUrl);
       res.set('Content-Type', 'text/html; charset=utf-8');
-      return res.send(html);
+      return res.send(html); // Already a string
     }
 
-    // === OTHER (pass through) ===
-    const buffer = Buffer.from(await response.arrayBuffer());
-    res.set('Content-Type', contentType || 'application/octet-stream');
-    return res.send(buffer);
+    // === OTHER ===
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.set('Content-Type', ct || 'application/octet-stream');
+    return res.send(buf);
 
-  } catch (error) {
-    console.error(`[ERROR] ${error.message}`);
-    
-    if (error.name === 'TimeoutError' || error.name === 'AbortError') {
-      return res.status(504).send('Timeout');
-    }
-    
-    res.status(500).send(`
-      <html><body style="font-family:system-ui;padding:40px;text-align:center;background:#111;color:#fff">
-        <h2>Failed to load</h2>
-        <p style="color:#888">${error.message}</p>
-        <a href="javascript:history.back()" style="color:#58f">Go back</a>
-      </body></html>
-    `);
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') return res.status(504).end('Timeout');
+    return res.status(500).end('Error: ' + e.message);
   }
 });
 
-// === REWRITE FUNCTIONS (optimized) ===
+// ==================== REWRITERS ====================
 
-function rewriteHtml(html, baseUrl, proxyBase, currentUrl) {
-  // Remove blocking attributes
-  html = html.replace(/\s+(integrity|nonce|crossorigin)=["'][^"']*["']/gi, '');
-  html = html.replace(/<meta[^>]*content-security-policy[^>]*>/gi, '');
+function rewriteHTML(html, base, pb, curUrl) {
+  // Decode entities
+  html = html.replace(RE.amp, '&');
   
-  // Rewrite common attributes in one pass using a map
-  const attrPatterns = [
-    [/(<[^>]+\s)(href|src|action|poster|data-src)=["']([^"']+)["']/gi, (m, pre, attr, url) => {
-      if (!shouldRewrite(url)) return m;
-      return `${pre}${attr}="${makeProxyUrl(url, baseUrl, proxyBase, currentUrl)}"`;
-    }],
-    [/srcset=["']([^"']+)["']/gi, (m, srcset) => {
-      return `srcset="${rewriteSrcset(srcset, baseUrl, proxyBase, currentUrl)}"`;
-    }]
-  ];
+  // Remove security headers
+  html = html.replace(RE.csp, '');
+  html = html.replace(RE.security, '');
   
-  for (const [pattern, replacer] of attrPatterns) {
-    html = html.replace(pattern, replacer);
+  // Rewrite URL attributes
+  for (const attr of URL_ATTRS) {
+    ATTR_RE[attr].lastIndex = 0;
+    html = html.replace(ATTR_RE[attr], (match, prefix, quote, url) => {
+      if (skipUrl(url)) return match;
+      
+      if (attr === 'srcset' || attr === 'data-srcset') {
+        return `${prefix}${quote}${rewriteSrcset(url, base, pb, curUrl)}${quote}`;
+      }
+      
+      return `${prefix}${quote}${proxyUrl(url, base, pb, curUrl)}${quote}`;
+    });
   }
   
-  // Rewrite inline styles
-  html = html.replace(/style=["']([^"']*url\([^)]+\)[^"']*)["']/gi, (m, style) => {
-    return `style="${rewriteCssUrls(style, baseUrl, proxyBase, currentUrl)}"`;
+  // Inline styles
+  RE.style.lastIndex = 0;
+  html = html.replace(RE.style, (match, prefix, quote, style, end) => {
+    if (!style.includes('url(')) return match;
+    return `${prefix}${quote}${rewriteCSSUrls(style, base, pb, curUrl)}${end}`;
   });
   
-  // Rewrite style blocks
-  html = html.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (m, css) => {
-    return m.replace(css, rewriteCss(css, baseUrl, proxyBase, currentUrl));
+  // Style blocks
+  RE.styleBlock.lastIndex = 0;
+  html = html.replace(RE.styleBlock, (match, attrs, css) => {
+    return `<style${attrs}>${rewriteCSS(css, base, pb, curUrl)}</style>`;
   });
   
   return html;
 }
 
-function rewriteCss(css, baseUrl, proxyBase, currentUrl) {
-  // Rewrite url()
-  css = rewriteCssUrls(css, baseUrl, proxyBase, currentUrl);
+function rewriteCSS(css, base, pb, curUrl) {
+  css = rewriteCSSUrls(css, base, pb, curUrl);
   
-  // Rewrite @import
-  css = css.replace(/@import\s+["']([^"']+)["']/gi, (m, url) => {
-    if (!shouldRewrite(url)) return m;
-    return `@import "${makeProxyUrl(url, baseUrl, proxyBase, currentUrl)}"`;
-  });
+  RE.cssImport1.lastIndex = 0;
+  css = css.replace(RE.cssImport1, (m, url) => skipUrl(url) ? m : `@import "${proxyUrl(url, base, pb, curUrl)}"`);
   
-  css = css.replace(/@import\s+url\(["']?([^"')]+)["']?\)/gi, (m, url) => {
-    if (!shouldRewrite(url)) return m;
-    return `@import url("${makeProxyUrl(url, baseUrl, proxyBase, currentUrl)}")`;
-  });
+  RE.cssImport2.lastIndex = 0;
+  css = css.replace(RE.cssImport2, (m, url) => skipUrl(url) ? m : `@import url("${proxyUrl(url, base, pb, curUrl)}")`);
   
   return css;
 }
 
-function rewriteCssUrls(css, baseUrl, proxyBase, currentUrl) {
-  return css.replace(/url\(["']?([^"')]+)["']?\)/gi, (m, url) => {
-    if (!shouldRewrite(url)) return m;
-    return `url("${makeProxyUrl(url, baseUrl, proxyBase, currentUrl)}")`;
-  });
+function rewriteCSSUrls(css, base, pb, curUrl) {
+  RE.cssUrl.lastIndex = 0;
+  return css.replace(RE.cssUrl, (m, url) => skipUrl(url) ? m : `url("${proxyUrl(url, base, pb, curUrl)}")`);
 }
 
-function rewriteSrcset(srcset, baseUrl, proxyBase, currentUrl) {
+function rewriteSrcset(srcset, base, pb, curUrl) {
   return srcset.split(',').map(part => {
-    const [url, ...rest] = part.trim().split(/\s+/);
-    if (!shouldRewrite(url)) return part;
-    return [makeProxyUrl(url, baseUrl, proxyBase, currentUrl), ...rest].join(' ');
+    const t = part.trim();
+    if (!t) return part;
+    RE.srcset.lastIndex = 0;
+    const m = t.match(RE.srcset);
+    if (!m) return part;
+    if (skipUrl(m[1])) return part;
+    return proxyUrl(m[1], base, pb, curUrl) + (m[2] || '');
   }).join(', ');
 }
 
-function shouldRewrite(url) {
-  if (!url) return false;
-  if (url.startsWith('data:') || url.startsWith('blob:') || 
-      url.startsWith('javascript:') || url.startsWith('#') ||
-      url.startsWith('about:')) return false;
-  return true;
+function skipUrl(url) {
+  if (!url) return true;
+  const c = url[0];
+  return c === '#' || c === '{' || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:') || url.startsWith('mailto:') || url.startsWith('tel:');
 }
 
-function makeProxyUrl(url, baseUrl, proxyBase, currentUrl) {
+function proxyUrl(url, base, pb, curUrl) {
+  if (!url) return url;
+  url = url.trim();
+  if (skipUrl(url)) return url;
+  
   try {
     let abs;
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      abs = url;
-    } else if (url.startsWith('//')) {
-      abs = 'https:' + url;
-    } else if (url.startsWith('/')) {
-      abs = baseUrl + url;
-    } else {
-      abs = new URL(url, currentUrl).href;
-    }
-    return proxyBase + encodeURIComponent(abs);
-  } catch {
-    return url;
-  }
+    if (url.startsWith('http://') || url.startsWith('https://')) abs = url;
+    else if (url.startsWith('//')) abs = 'https:' + url;
+    else if (url[0] === '/') abs = base + url;
+    else abs = new URL(url, curUrl).href;
+    return pb + encodeURIComponent(abs);
+  } catch { return url; }
 }
 
-function createScript(proxyBase, baseUrl, currentUrl) {
-  return `<script>(function(){
-const P='${proxyBase}',B='${baseUrl}',C='${currentUrl}';
-function px(u){
-  if(!u||u[0]=='#'||u.startsWith('javascript:'))return u;
-  try{
-    let a;
-    if(u.startsWith('http'))a=u;
-    else if(u.startsWith('//'))a='https:'+u;
-    else if(u[0]=='/')a=B+u;
-    else a=new URL(u,C).href;
-    return P+encodeURIComponent(a);
-  }catch{return u}
+function injectScript(html, pb, base, curUrl) {
+  // Ultra-minified script (~650 bytes)
+  const s = `<script>!function(){var P="${pb}",B="${base}",C="${curUrl}";function A(u){return!u?u:(u=u.trim()).startsWith("http")?u:u.startsWith("//")?("https:"+u):u[0]=="/"?(B+u):new URL(u,C).href}function X(u){return!u||u[0]=="#"||u.slice(0,4)=="java"||u.slice(0,5)=="data:"?u:P+encodeURIComponent(A(u))}onclick=function(e){var a=e.target.closest("a");if(a){var h=a.getAttribute("href");if(h&&h[0]!="#"&&h.slice(0,4)!="java"){e.preventDefault();e.stopPropagation();var u=A(h);parent!=window?parent.postMessage({type:"navigate",url:u},"*"):location.href=X(h)}}};onsubmit=function(e){e.preventDefault();var f=e.target,a=A(f.action||C),m=(f.method||"GET").toUpperCase(),d=new URLSearchParams(new FormData(f));if(m=="GET"){var u=a+(a.includes("?")?"&":"?")+d;parent!=window?parent.postMessage({type:"navigate",url:u},"*"):location.href=X(u)}else{var n=document.createElement("form");n.method="POST";n.action=P+encodeURIComponent(a);n.hidden=1;d.forEach(function(v,k){var i=document.createElement("input");i.type="hidden";i.name=k;i.value=v;n.appendChild(i)});document.body.appendChild(n);n.submit()}}}()</script>`;
+  
+  const i = html.indexOf('</head>');
+  if (i !== -1) return html.substring(0, i) + s + html.substring(i);
+  const j = html.indexOf('<body');
+  if (j !== -1) { const k = html.indexOf('>', j); return html.substring(0, k + 1) + s + html.substring(k + 1); }
+  return s + html;
 }
-document.addEventListener('click',e=>{
-  const a=e.target.closest('a[href]');
-  if(a){
-    const h=a.getAttribute('href');
-    if(h&&h[0]!='#'&&!h.startsWith('javascript:')){
-      e.preventDefault();
-      const url=h.startsWith('http')?h:new URL(h,C).href;
-      if(parent!==window)parent.postMessage({type:'navigate',url},'*');
-      else location.href=px(h);
-    }
-  }
-},true);
-document.addEventListener('submit',e=>{
-  e.preventDefault();
-  const f=e.target,m=(f.method||'GET').toUpperCase();
-  let a=f.action||C;
-  if(!a.startsWith('http'))a=a[0]=='/'?B+a:new URL(a,C).href;
-  const d=new URLSearchParams(new FormData(f));
-  if(m=='GET'){
-    parent.postMessage({type:'navigate',url:a+(a.includes('?')?'&':'?')+d},'*');
-  }else{
-    const nf=document.createElement('form');
-    nf.method='POST';nf.action=P+encodeURIComponent(a);nf.style.display='none';
-    for(const[k,v]of d){const i=document.createElement('input');i.type='hidden';i.name=k;i.value=v;nf.appendChild(i)}
-    document.body.appendChild(nf);nf.submit();
-  }
-},true);
-})();</script>`;
-}
-
-// === ROOT & 404 ===
-app.get('/', (req, res) => {
-  res.json({ name: 'Web Proxy', version: '4.0.0', cache: `${cache.size} items` });
-});
-
-app.use((req, res) => res.status(404).send('Not found'));
 
 // === START ===
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-╔════════════════════════════════════════════╗
-║     ⚡ Fast Web Proxy v4.0.0               ║
-╠════════════════════════════════════════════╣
-║  Port: ${PORT}                                 ║
-║  Cache: 100MB max, 10min TTL               ║
-║                                            ║
-║  ⚠️  Make port ${PORT} PUBLIC!                 ║
-╚════════════════════════════════════════════╝
-  `);
-});
+app.get('/', (_, r) => r.json({ v: '9.0' }));
+app.use((_, r) => r.status(404).end());
+
+app.listen(PORT, '0.0.0.0', () => console.log(`⚡ Proxy v9 on :${PORT}`));
